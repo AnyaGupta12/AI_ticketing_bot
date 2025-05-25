@@ -1,0 +1,9 @@
+passlib
+fitz
+frontend
+tools
+chromadb
+sentence-transformers
+torch
+streamlit
+matplotlib
