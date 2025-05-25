@@ -6,10 +6,14 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from db import get_conn
 
+
+
 def agent_dashboard():
 
-    st.subheader(f" Agent Dashboard ({st.session_state['user_name']})")
-    st.markdown("*(Here you’ll eventually see your ticket queue and AI-assist tools.)*")
+    st.markdown(
+    f"<h2 style='text-align: center;'>Agent Dashboard ({st.session_state['user_name']})</h2>",
+    unsafe_allow_html=True
+)
 
     agent_id = st.session_state.get("user_id")
     company_id = st.session_state.get("company_id")
@@ -17,59 +21,44 @@ def agent_dashboard():
     conn = sqlite3.connect("app.db", check_same_thread=False)
     c = conn.cursor()
 
-    # -- Ticket Summary for this agent
-    c.execute("""
-        SELECT status, COUNT(*) FROM Tickets
-        WHERE user_id = ? AND company_id = ?
-        GROUP BY status;
-    """, (agent_id, company_id))
-    rows = c.fetchall()
-
-    if rows:
-        st.markdown("### Your Ticket Summary")
-        df = pd.DataFrame(rows, columns=["Status", "Count"])
-        fig, ax = plt.subplots()
-        ax.pie(df["Count"], labels=df["Status"], autopct="%1.1f%%", startangle=90, colors=["orange", "green"])
-        ax.axis("equal")
-        st.pyplot(fig)
-    else:
-        st.info("You have not handled any tickets yet.")
-
     # Load all open tickets
     c.execute("""
         SELECT id, product, priority, problem_description, contact_name, contact_email
         FROM Tickets
-        WHERE company_id = ? AND status = 'Open'
+        WHERE company_id = ? AND status = 'Handoff'
         ORDER BY created_at DESC;
     """, (company_id,))
     tickets = c.fetchall()
 
     if not tickets:
-        st.success("No open tickets at the moment.")
+        st.success("No handoff tickets at the moment.")
         return
+    
+    if "user_id" not in st.session_state or "user_name" not in st.session_state:
+        st.error("Please log in to access the agent dashboard.")
+        st.stop()
 
-    st.markdown("### Open Tickets")
+    st.markdown("### Handoff Tickets")
 
     for ticket in tickets:
         ticket_id, product, priority, desc, contact_name, contact_email = ticket
         with st.expander(f"Ticket #{ticket_id} - {product} [{priority}]"):
+            st.warning("This ticket was flagged by the AI for human attention.")
             st.write(f"**Submitted by:** {contact_name} ({contact_email})")
             st.write(f"**Issue:** {desc}")
 
+            if st.button(f"Join Chat", key=f"join_{ticket_id}"):
+                st.session_state['current_ticket_id'] = ticket_id
+                st.switch_page("pages/agent_chat.py")  # or use st.experimental_set_query_params
+
             if st.button(f" Mark as Resolved", key=f"resolve_{ticket_id}"):
-                c.execute("UPDATE Tickets SET status = 'Closed' WHERE id = ?", (ticket_id,))
+                c.execute("""
+                UPDATE Tickets SET status = 'closed', user_id = ? WHERE id = ?""", (agent_id, ticket_id))
                 conn.commit()
                 st.success(f"Ticket #{ticket_id} marked as resolved.")
                 st.rerun()
 
     st.markdown("---")
-    st.markdown("### Check Company Knowledge Base")
 
-    query = st.text_input("Enter your question to the knowledge base")
-    if st.button("Ask"):
-        if query:
-            from pages.chatbot_utils import query_kb
-            response = query_kb(query, company_id)
-            st.success(response)
-        else:
-            st.warning("Please enter a question.")
+if __name__ == "__main__":
+    agent_dashboard()

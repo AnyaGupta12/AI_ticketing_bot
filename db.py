@@ -68,18 +68,28 @@ def init_db():
             FOREIGN KEY(company_id) REFERENCES Company(id)
         );
     """)
+    # Ensure chat_sessions uses a nullable session_id and is indexed by ticket_id
     execute("""
-            CREATE TABLE IF NOT EXISTS chat_sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticket_id INTEGER,
-                session_id TEXT NOT NULL,
-                user_name TEXT NOT NULL,
-                sender TEXT CHECK(sender IN ('user', 'bot', 'agent')) NOT NULL,
-                message TEXT NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(ticket_id) REFERENCES Tickets(id)
-            );
+    CREATE TABLE IF NOT EXISTS chat_sessions (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticket_id   INTEGER NOT NULL,
+        session_id  TEXT,                        -- now nullable
+        user_name   TEXT NOT NULL,
+        sender      TEXT 
+                    CHECK(sender IN ('user','bot','agent')) 
+                    NOT NULL,
+        message     TEXT NOT NULL,
+        timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(ticket_id) REFERENCES Tickets(id)
+    );
     """)
+
+    # Make lookups by ticket_id fast
+    execute("""
+    CREATE INDEX IF NOT EXISTS idx_chat_ticket
+    ON chat_sessions(ticket_id);
+    """)
+
     
     execute("""
         CREATE TABLE IF NOT EXISTS KBDocument (

@@ -7,23 +7,31 @@ from pages.raise_ticket import save_chat_message, check_inactivity_and_close
 import requests
 import json
 from datetime import datetime, timedelta
+from streamlit_autorefresh import st_autorefresh
+
+
+
+def get_cutoff(minutes: int) -> datetime:
+    return datetime.now() - timedelta(minutes=minutes)
 
 
 GEMINI_API_KEY = "AIzaSyCl-Ys-YuIoTBzN0fI8gcLmyIZsRp_zxWY"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + GEMINI_API_KEY
 
 
-def load_recent_chat(session_id):
+def load_ticket_chat(ticket_id):
     conn = sqlite3.connect("app.db", check_same_thread=False)
     c = conn.cursor()
-    cutoff = datetime.now() - timedelta(minutes=30)
+    cutoff = get_cutoff(30)
     c.execute(
         """
-        SELECT sender, message FROM chat_sessions
-        WHERE session_id = ? AND timestamp >= ?
-        ORDER BY timestamp
+        SELECT sender, message 
+          FROM chat_sessions
+         WHERE ticket_id = ? 
+           AND timestamp >= ?
+         ORDER BY timestamp
         """,
-        (session_id, cutoff)
+        (ticket_id, cutoff)
     )
     return c.fetchall()
 
@@ -147,17 +155,18 @@ def chatbot_page():
 
     user_name = st.session_state.get("user_name")
 
+    # This will rerun the script every 10 seconds (10000 ms)
+    st_autorefresh(interval=15000, limit=None, key="chat_refresh")
+
     st.title("💬 Hack_X Support Chatbot")
 
     # 1. Ensure session + ticket exist
     if "session_id" not in st.session_state or "ticket_id" not in st.session_state:
         st.warning("Please start or resume a session from the home page.")
         st.stop()
-
-    # 2. Load & display history (once)
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = load_recent_chat(st.session_state["session_id"])
-    for sender, msg in st.session_state.chat_history:
+    
+    history = load_ticket_chat(st.session_state["ticket_id"])
+    for sender, msg in history:
         with st.chat_message(sender):
             st.write(msg)
 
@@ -178,6 +187,25 @@ def chatbot_page():
         if status.lower() == "closed":
             st.warning("🚫 This ticket has already been closed. No further messages can be sent.")
             return
+        
+        if status.lower() == "handoff":
+            st.warning("🔁 This ticket has been escalated to a human agent. Please wait for them to reply here.")
+            # Still allow the user to type, but skip LLM
+            user_input = st.chat_input("Your message…")
+            if user_input:
+                # echo back their message
+                st.chat_message("user").write(user_input)
+                # save it so the agent sees it
+                save_chat_message(
+                    session_id=st.session_state["session_id"],
+                    sender="user",
+                    message=user_input,
+                    ticket_id=ticket_id
+                )
+                # optionally remind again
+                st.info("Your message has been sent to the agent. They'll reply in this same window.")
+            return   # skip the rest of the LLM logic
+
 
         st.markdown(f"**Ticket #{ticket_id}**")
         st.markdown(f"- **Product:** {product}")
@@ -204,9 +232,6 @@ def chatbot_page():
             conn.commit()
             st.success("✅ Ticket marked as closed. Thank you!")
             return  # stop further interaction
-
-        # 1. Pull in the last 10 messages for context
-        history = st.session_state.chat_history
 
         # 2. Get the top-k KB chunks
         top_chunks = get_top_k_chunks(user_input, k=3)
@@ -238,11 +263,6 @@ def chatbot_page():
         st.chat_message("user").write(user_input)
         st.chat_message("bot").write(bot_reply)
 
-        # 6. Append to session_state and save to DB
-        st.session_state.chat_history.extend([
-            ("user", user_input),
-            ("bot", bot_reply)
-        ])
         save_chat_message(
             session_id=st.session_state["session_id"],
             sender="user",
@@ -255,4 +275,5 @@ def chatbot_page():
             message=bot_reply,
             ticket_id=st.session_state["ticket_id"]
         )
+
 chatbot_page()
