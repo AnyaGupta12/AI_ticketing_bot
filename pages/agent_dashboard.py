@@ -73,6 +73,3 @@ def agent_dashboard():
             st.success(response)
         else:
             st.warning("Please enter a question.")
-
-
-

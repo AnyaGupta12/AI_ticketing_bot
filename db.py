@@ -1,10 +1,6 @@
 # File: db.py
 import sqlite3
 import threading
-from passlib.context import CryptContext
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 
 # Single shared connection
 _conn = sqlite3.connect(
@@ -95,21 +91,3 @@ def init_db():
             FOREIGN KEY(company_id) REFERENCES Company(id) ON DELETE CASCADE
         );
     """)
-
-    # Ensure default admin exists (company: Hack_X)
-    conn = get_conn()
-    c = conn.cursor()
-    
-    # Insert company if not exists
-    c.execute("INSERT OR IGNORE INTO Company (id, name) VALUES (1, 'Hack_X');")
-    
-    # Check if admin user exists
-    c.execute("SELECT id FROM User WHERE email = 'admin';")
-    if not c.fetchone():
-        pw_hash = pwd_context.hash("admin")
-        c.execute("""
-            INSERT INTO User (company_id, name, email, password_hash, role)
-            VALUES (?, ?, ?, ?, ?);
-        """, (1, 'Default Admin', 'admin', pw_hash, 'admin'))
-
-    

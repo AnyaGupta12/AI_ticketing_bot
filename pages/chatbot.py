@@ -3,12 +3,35 @@ import sqlite3
 import chromadb
 from chromadb.utils import embedding_functions
 from sentence_transformers import SentenceTransformer
-from pages.raise_ticket import load_recent_chat, save_chat_message
+from pages.raise_ticket import save_chat_message, check_inactivity_and_close
 import requests
 import json
+from datetime import datetime, timedelta
+
 
 GEMINI_API_KEY = "AIzaSyCl-Ys-YuIoTBzN0fI8gcLmyIZsRp_zxWY"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + GEMINI_API_KEY
+
+
+def load_recent_chat(session_id):
+    conn = sqlite3.connect("app.db", check_same_thread=False)
+    c = conn.cursor()
+    cutoff = datetime.now() - timedelta(minutes=30)
+    c.execute(
+        """
+        SELECT sender, message FROM chat_sessions
+        WHERE session_id = ? AND timestamp >= ?
+        ORDER BY timestamp
+        """,
+        (session_id, cutoff)
+    )
+    return c.fetchall()
+
+CLOSING_KEYWORDS = ["thank you", "thanks", "bye", "goodbye", "see you"]
+
+def check_if_closing_message(message):
+    return any(keyword in message.lower() for keyword in CLOSING_KEYWORDS)
+
 
 def build_prompt(history, context, ticket, user_input):
     # 1. Take the last 10 messages (or fewer if history is shorter)
@@ -18,17 +41,30 @@ def build_prompt(history, context, ticket, user_input):
     convo = "\n".join(f"{sender.capitalize()}: {msg}" for sender, msg in recent)
 
     # 3. Unpack ticket into named fields
-    prod, desc, prio, cid = ticket
+    prod, desc, prio, cid, contact_name = ticket
     ticket_info = (
         f"Ticket #{st.session_state.get('ticket_id')} info:\n"
         f"- Product: {prod}\n"
         f"- Priority: {prio}\n"
-        f"- Description: {desc}"
+        f"- Description: {desc}\n"
+        f"- Company ID: {cid}\n"
+        f"- Contact Name: {contact_name}"
     )
 
     # 4. Assemble full prompt
     prompt = f"""
-You are a helpful support assistant. Continue the conversation below, then answer the final user question.
+You are a helpful support assistant. Continue the conversation and assist the user based on the knowledge base and ticket context.
+
+If the user's question:
+- cannot be answered using the knowledge base,
+- is unclear, illogical, or off-topic,
+- or requires a human agent's help (e.g. refund requests, complaints, escalation, sensitive cases),
+
+then **mark the response with**:
+
+**[HANDOFF_REQUIRED]**
+
+! Do **NOT** trigger handoff for casual messages such as "hi", "hello", "how are you", "thank you", or other greetings or you feel it is normal human behavior.
 
 {ticket_info}
 
@@ -54,8 +90,22 @@ def call_gemini_llm(history, context: str, query: str, ticket: tuple) -> str:
     headers = {"Content-Type": "application/json"}
 
     resp = requests.post(GEMINI_URL, headers=headers, data=json.dumps(payload))
+    
     if resp.status_code == 200:
-        return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        try:
+            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            
+            # Try to parse it as JSON if it looks like a JSON object
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, dict) and "response" in parsed:
+                    return parsed["response"]
+                return text
+            except json.JSONDecodeError:
+                return text
+
+        except (KeyError, IndexError) as e:
+            return f"Error parsing response: {e}"
     else:
         return f"Error: {resp.status_code} – {resp.text}"
 
@@ -91,20 +141,22 @@ def get_top_k_chunks(query, k=3):
     results = collection.query(query_embeddings=[query_embedding], n_results=k)
     return results['documents'][0] if results['documents'] else []
 
+
+
 def chatbot_page():
+
+    user_name = st.session_state.get("user_name")
 
     st.title("💬 Hack_X Support Chatbot")
 
-    # --- Ensure required session info exists ---
-    if "session_id" not in st.session_state or "user_name" not in st.session_state:
-        st.warning("Session not initialized. Please go to the home page to start or resume a chat.")
+    # 1. Ensure session + ticket exist
+    if "session_id" not in st.session_state or "ticket_id" not in st.session_state:
+        st.warning("Please start or resume a session from the home page.")
         st.stop()
 
-    # --- Load chat history once per session ---
+    # 2. Load & display history (once)
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = load_recent_chat(st.session_state["session_id"])
-    
-    # --- Display existing messages ---
     for sender, msg in st.session_state.chat_history:
         with st.chat_message(sender):
             st.write(msg)
@@ -117,11 +169,16 @@ def chatbot_page():
     conn = get_connection()
     c = conn.cursor()
 
-    c.execute("SELECT product, problem_description, priority, company_id FROM Tickets WHERE id = ?", (ticket_id,))
+    c.execute("SELECT product, problem_description, priority, company_id, status FROM Tickets WHERE id = ?", (ticket_id,))
     ticket = c.fetchone()
 
     if ticket:
-        product, problem_description, priority, company_id = ticket
+        product, problem_description, priority, company_id, status = ticket
+
+        if status.lower() == "closed":
+            st.warning("🚫 This ticket has already been closed. No further messages can be sent.")
+            return
+
         st.markdown(f"**Ticket #{ticket_id}**")
         st.markdown(f"- **Product:** {product}")
         st.markdown(f"- **Priority:** {priority}")
@@ -131,11 +188,23 @@ def chatbot_page():
         st.error("❌ Ticket not found.")
         return
 
+
     # Load KB into Chroma for this company
     load_kb_to_chroma(conn, company_id)
 
+    if check_inactivity_and_close(st.session_state["session_id"], ticket_id):
+        return  # Exit the chatbot
+
     user_input = st.chat_input("Ask about your issue...")
     if user_input:
+
+         # Check for closing message
+        if check_if_closing_message(user_input):
+            c.execute("UPDATE Tickets SET status = 'closed' WHERE id = ?", (ticket_id,))
+            conn.commit()
+            st.success("✅ Ticket marked as closed. Thank you!")
+            return  # stop further interaction
+
         # 1. Pull in the last 10 messages for context
         history = st.session_state.chat_history
 
@@ -144,16 +213,26 @@ def chatbot_page():
         kb_context = "\n\n".join(top_chunks)
 
         # 3. Fetch the ticket metadata you unpacked earlier
-        #    (Make sure `ticket = c.fetchone()` ran above in your code)
+        #    (Make sure ticket = c.fetchone() ran above in your code)
         #    e.g. ticket = (product, desc, prio, company_id)
 
-        # 4. Call the LLM with history + KB + ticket info baked in
+        # 4. Call the LLM
         bot_reply = call_gemini_llm(
             history=history,
             context=kb_context,
             query=user_input,
             ticket=ticket
         )
+
+        # 4.5 Check for LLM-triggered handoff
+        if "[HANDOFF_REQUIRED]" in bot_reply:
+            c.execute("UPDATE Tickets SET status = 'Handoff' WHERE id = ?", (ticket_id,))
+            conn.commit()
+            st.warning("🔁 Your ticket has been marked for human assistance.")
+
+            # Optional: remove the marker before displaying
+            bot_reply = bot_reply.replace("[HANDOFF_REQUIRED]", "").strip()
+
 
         # 5. Display both sides
         st.chat_message("user").write(user_input)
@@ -166,23 +245,14 @@ def chatbot_page():
         ])
         save_chat_message(
             session_id=st.session_state["session_id"],
-            user_name=st.session_state["user_name"],
             sender="user",
             message=user_input,
             ticket_id=st.session_state["ticket_id"]
         )
         save_chat_message(
             session_id=st.session_state["session_id"],
-            user_name=st.session_state["user_name"],
             sender="bot",
             message=bot_reply,
             ticket_id=st.session_state["ticket_id"]
         )
-
-
-    for sender, msg in st.session_state.chat_history:
-        with st.chat_message(sender):
-            st.write(msg)
-    st.markdown("---")
-
 chatbot_page()

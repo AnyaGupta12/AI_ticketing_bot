@@ -3,7 +3,9 @@ import sqlite3
 import fitz  # PyMuPDF
 import pandas as pd
 import matplotlib.pyplot as plt
-
+import seaborn as sns
+import io
+import base64
 # --- Database Connection ---
 @st.cache_resource
 def get_connection():
@@ -61,16 +63,54 @@ def admin_dashboard():
     status_data = c.fetchall()
     ticket_df = pd.DataFrame(status_data, columns=["Status", "Count"])
 
-    # Bar chart
+        # Bar chart
+
     st.markdown("### Ticket Status Overview")
+
     if not ticket_df.empty:
-        fig, ax = plt.subplots()
-        ax.bar(ticket_df["Status"], ticket_df["Count"], color=["#FFA07A", "#90EE90"])
-        ax.set_ylabel("Count")
-        ax.set_title("Open vs Closed Tickets")
-        st.pyplot(fig)
+        plt.style.use("dark_background")
+
+        fig, ax = plt.subplots(figsize=(4, 4), dpi=100)  # 4 inches * 100 dpi = 400 pixels
+
+        # Data
+        labels = ticket_df["Status"]
+        sizes = ticket_df["Count"]
+        colors = ["#FFA07A", "#90EE90", "#6495ED"]  # open, closed, handoff
+
+        wedges, texts, autotexts = ax.pie(
+            sizes,
+            labels=labels,
+            colors=colors[:len(labels)],
+            autopct='%1.1f%%',
+            startangle=140,
+            textprops={'color': "white", 'fontsize': 8},
+            wedgeprops={'linewidth': 0.5, 'edgecolor': 'gray'}
+        )
+
+        ax.set_title("Ticket Status", color='white', fontsize=10)
+        fig.tight_layout()
+
+        # Save figure to a bytes buffer
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches='tight', transparent=True)
+        plt.close(fig)  # Close the figure to free memory
+        buf.seek(0)
+
+        # Display image with HTML style for size control
+        st.markdown(
+            """
+            <div style="width: 400px; height: 400px; margin: auto;">
+                <img src="data:image/png;base64,{}" style="width: 400px; height: 400px; display: block; margin-left: auto; margin-right: auto;">
+            </div>
+            """.format(base64.b64encode(buf.read()).decode()),
+            unsafe_allow_html=True
+        )
+
     else:
         st.info("No tickets found.")
+
+
+
 
     # === User Stats ===
     c.execute("SELECT role, COUNT(*) FROM User WHERE company_id = ? GROUP BY role;", (company_id,))
@@ -92,7 +132,7 @@ def admin_dashboard():
         if col4.button("❌ Delete", key=f"delete_{agent_id}"):
             delete_agent(agent_id)
             st.success(f"Deleted agent {name}")
-            st.experimental_rerun()
+            st.rerun()
 
 
     st.divider()
