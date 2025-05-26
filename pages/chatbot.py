@@ -192,20 +192,34 @@ def chatbot_page():
 
     product, problem_description, priority, company_id, status = ticket
 
+    history = load_ticket_chat(ticket_id)
+    for sender, msg in history:
+        st.chat_message(sender).write(msg)
+
     # Status checks
     if status.lower() == "closed":
         st.warning("🚫 This ticket has already been closed.")
         return
+    
     if status.lower() == "handoff":
         st_autorefresh(interval=15000, limit=None, key="refresh")
         st.warning("🔁 Ticket escalated to human agent. Please wait.")
+
         user_input = st.chat_input("Your message…")
         if user_input:
+            # echo & persist
             st.chat_message("user").write(user_input)
             save_chat_message(
-                st.session_state.session_id, "user", user_input, ticket_id
+                session_id=st.session_state["session_id"],
+                sender="user",
+                message=user_input,
+                ticket_id=ticket_id
             )
             st.info("Your message has been sent to the agent.")
+            # refresh to show the newly saved message
+            st.rerun()
+
+        # don’t return here—let the page stay open so autorefresh can pull in new agent replies
         return
 
     # Display ticket info

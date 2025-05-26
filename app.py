@@ -80,7 +80,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Title
-st.markdown("<div class='title'>🚀 Welcome to Hack_X Support Platform</div>", unsafe_allow_html=True)
+st.markdown("<div class='title'>Welcome to Hack_X Support Platform</div>", unsafe_allow_html=True)
 
 # Role Cards
 col1, col2, col3 = st.columns(3)
