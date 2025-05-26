@@ -1,9 +1,12 @@
+streamlit
+streamlit-autorefresh
 passlib
-fitz
-frontend
-tools
+PyMuPDF
+requests
+pandas
+matplotlib
+seaborn
 chromadb
 sentence-transformers
 torch
-streamlit
-matplotlib
+numpy
