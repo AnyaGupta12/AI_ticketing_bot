@@ -40,15 +40,11 @@ CLOSING_KEYWORDS = ["thank you", "thanks", "bye", "goodbye", "see you"]
 def check_if_closing_message(message):
     return any(keyword in message.lower() for keyword in CLOSING_KEYWORDS)
 
-
 def build_prompt(history, context, ticket, user_input):
-    # 1. Take the last 10 messages (or fewer if history is shorter)
     recent = history[-10:] if len(history) > 10 else history
 
-    # 2. Turn into "User: …" / "Bot: …" lines
     convo = "\n".join(f"{sender.capitalize()}: {msg}" for sender, msg in recent)
 
-    # 3. Unpack ticket into named fields
     prod, desc, prio, cid, contact_name = ticket
     ticket_info = (
         f"Ticket #{st.session_state.get('ticket_id')} info:\n"
@@ -59,41 +55,33 @@ def build_prompt(history, context, ticket, user_input):
         f"- Contact Name: {contact_name}"
     )
 
-    # 4. Assemble full prompt
+    context_block = context if context else "[No relevant KB context found]"
+
     prompt = f"""You are a highly knowledgeable support assistant whose job is to resolve customer issues quickly and accurately. You have access to:
 
 1. **Ticket Details**  
-   Ticket #{{ticket_id}}  
-   • Product: {{product}}  
-   • Priority: {{priority}}  
-   • Description: {{description}}  
-   • Company ID: {{company_id}}  
-   • Contact: {{contact_name}}
+{ticket_info}
 
 2. **Relevant Knowledge Base Excerpts**  
-   {{#if context}}
-   {{context}}
-   {{else}}
-   [No relevant KB context found]
-   {{/if}}
+{context_block}
 
 3. **Recent Conversation History** (last 10 turns):  
-   {{#each history}}
-   {{sender}}: {{message}}
-   {{/each}}
+{convo}
 
 **Your instructions:**  
 - **Primary Source:** If the KB excerpts contain all or part of the answer, use only that information—do not fabricate or add external data.  
 - **Secondary Source:** If the KB is empty or insufficient, draw on your broader expertise or reliable online resources via Gemini to craft a complete, accurate, and concise response.  
 - **Tone & Style:** Be professional, empathetic, and clear. Use bullet points or numbered steps if it helps the user.  
 - **Scope:** Answer the user’s question directly. Do not initiate a handoff or mention internal processes.  
+-** whenever there is "forward me to human agent query mark it as [HANDOFF_REQUIRED] in the response.
 
 **User’s question:**  
-{{user_input}}
+{user_input}
 
 **Assistant’s response:**  
 """
     return prompt.strip()
+
 
 def call_gemini_llm(history, context: str, query: str, ticket: tuple) -> str:
     prompt = build_prompt(history, context, ticket, query)

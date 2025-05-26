@@ -71,7 +71,7 @@ def build_prompt(history, context, ticket_meta, user_input):
         f"- Contact: {contact}"
     )
     return f"""
-You are a helpful support assistant. Use the ticket info and the knowledge base to answer.
+You are a helpful support assistant. Use the ticket info and the knowledge base to answer if not sufficientfind online and repply.
 
 {info}
 
