@@ -271,7 +271,7 @@ def chatbot_page():
         )
         save_chat_message(
             session_id=st.session_state["session_id"],
-            sender="bot",
+            sender="assistant",
             message=bot_reply,
             ticket_id=st.session_state["ticket_id"]
         )

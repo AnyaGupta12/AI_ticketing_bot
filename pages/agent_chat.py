@@ -4,8 +4,6 @@ import sqlite3
 from datetime import datetime, timedelta
 from streamlit_autorefresh import st_autorefresh
 
-# Auto-refresh every 10 seconds
-st_autorefresh(interval=15000, limit=None, key="chat_refresh")
 
 def get_cutoff(minutes: int) -> datetime:
     return datetime.now() - timedelta(minutes=minutes)
@@ -14,6 +12,8 @@ def get_conn():
     return sqlite3.connect("app.db", check_same_thread=False)
 
 def agent_chat_page():
+    # Auto-refresh every 10 seconds
+    st_autorefresh(interval=15000, limit=None, key="chat_refresh")
     st.title(f"🛠️ Agent Chat – Ticket #{st.session_state.get('current_ticket_id')}")
     ticket_id = st.session_state.get("current_ticket_id")
     if not ticket_id:
@@ -41,7 +41,13 @@ def agent_chat_page():
         st.warning("No chat history in the last 30 minutes.")
     else:
         for sender, message, _ in rows:
-            role = "user" if sender == "user" else "assistant"
+            if sender == "user":
+                role = "user"
+            elif sender in ["bot", "agent"]:
+                role = "assistant"
+            else:
+                role = "user"  # fallback
+
             with st.chat_message(role):
                 st.write(message)
 
