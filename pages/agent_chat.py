@@ -13,8 +13,7 @@ import shutil
 from langchain.vectorstores import FAISS
 from langchain.embeddings import HuggingFaceEmbeddings
 
-# 1. Sentence-Transformer model (for fallback encoding) — you can keep or remove
-st_model = SentenceTransformer("all-MiniLM-L6-v2")
+
 # 2. LangChain embedding wrapper for FAISS
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
