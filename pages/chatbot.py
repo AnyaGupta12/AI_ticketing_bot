@@ -1,33 +1,55 @@
 import streamlit as st
 import sqlite3
-import chromadb
-from chromadb.utils import embedding_functions
-from sentence_transformers import SentenceTransformer
-from pages.raise_ticket import save_chat_message, check_inactivity_and_close
 import requests
 import json
+import os
+import pickle
 from datetime import datetime, timedelta
 from streamlit_autorefresh import st_autorefresh
+from sentence_transformers import SentenceTransformer
+from langchain.vectorstores import FAISS
+from langchain.embeddings import HuggingFaceEmbeddings
+from pages.raise_ticket import save_chat_message, check_inactivity_and_close
 
+# Constants
+GEMINI_API_KEY = "AIzaSyCl-Ys-YuIoTBzN0fI8gcLmyIZsRp_zxWY"
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+    f"?key={GEMINI_API_KEY}"
+)
+CLOSING_KEYWORDS = ["thank you", "thanks", "bye", "goodbye", "see you"]
 
+# Utility functions
 
 def get_cutoff(minutes: int) -> datetime:
     return datetime.now() - timedelta(minutes=minutes)
 
+@st.cache_resource
+def get_connection():
+    return sqlite3.connect("app.db", check_same_thread=False)
 
-GEMINI_API_KEY = "AIzaSyCl-Ys-YuIoTBzN0fI8gcLmyIZsRp_zxWY"
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + GEMINI_API_KEY
+def get_ticket_details(conn, ticket_id):
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT product, problem_description, priority, company_id, status
+          FROM Tickets
+         WHERE id = ?
+        """,
+        (ticket_id,)
+    )
+    return c.fetchone()
 
 
 def load_ticket_chat(ticket_id):
-    conn = sqlite3.connect("app.db", check_same_thread=False)
+    conn = get_connection()
     c = conn.cursor()
     cutoff = get_cutoff(30)
     c.execute(
         """
-        SELECT sender, message 
+        SELECT sender, message
           FROM chat_sessions
-         WHERE ticket_id = ? 
+         WHERE ticket_id = ?
            AND timestamp >= ?
          ORDER BY timestamp
         """,
@@ -35,10 +57,10 @@ def load_ticket_chat(ticket_id):
     )
     return c.fetchall()
 
-CLOSING_KEYWORDS = ["thank you", "thanks", "bye", "goodbye", "see you"]
 
-def check_if_closing_message(message):
-    return any(keyword in message.lower() for keyword in CLOSING_KEYWORDS)
+def check_if_closing_message(message: str) -> bool:
+    return any(kw in message.lower() for kw in CLOSING_KEYWORDS)
+
 
 def build_prompt(history, context, ticket, user_input):
     recent = history[-10:] if len(history) > 10 else history
@@ -85,192 +107,161 @@ def build_prompt(history, context, ticket, user_input):
 
 def call_gemini_llm(history, context: str, query: str, ticket: tuple) -> str:
     prompt = build_prompt(history, context, ticket, query)
-
-    payload = {
-        "contents": [{
-            "parts": [{"text": prompt}]
-        }]
-    }
+    payload = {"contents": [{"parts": [{"text": prompt}]}]}
     headers = {"Content-Type": "application/json"}
-
     resp = requests.post(GEMINI_URL, headers=headers, data=json.dumps(payload))
-    
-    if resp.status_code == 200:
+    if resp.status_code != 200:
+        return f"Error: {resp.status_code} - {resp.text}"
+    data = resp.json()
+    try:
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        # Optional JSON parsing
         try:
-            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-            
-            # Try to parse it as JSON if it looks like a JSON object
-            try:
-                parsed = json.loads(text)
-                if isinstance(parsed, dict) and "response" in parsed:
-                    return parsed["response"]
-                return text
-            except json.JSONDecodeError:
-                return text
+            parsed = json.loads(text)
+            return parsed.get("response", text)
+        except json.JSONDecodeError:
+            return text
+    except Exception as e:
+        return f"Error parsing response: {e}"
 
-        except (KeyError, IndexError) as e:
-            return f"Error parsing response: {e}"
-    else:
-        return f"Error: {resp.status_code} – {resp.text}"
 
-# Setup embedding model
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+def load_faiss_index(company_id: int):
+    embedding_model = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+    faiss_folder = f"faiss_index_company_{company_id}"
+    if os.path.exists(faiss_folder):
+        st.info(f"Loading FAISS index from {faiss_folder}")
+        db = FAISS.load_local(
+            folder_path=faiss_folder,
+            embeddings=embedding_model,
+            allow_dangerous_deserialization=True,
+        )
+        return db, embedding_model, faiss_folder
+    st.warning(f"No FAISS index found for company {company_id}")
+    return None, embedding_model, faiss_folder
 
-# Setup ChromaDB in-memory client
-chroma_client = chromadb.Client()
-collection = chroma_client.get_or_create_collection(name="company_kb")
-
-@st.cache_resource
-def get_connection():
-    return sqlite3.connect("app.db", check_same_thread=False)
-
-def load_kb_to_chroma(conn, company_id):
+def load_kb_to_faiss(conn, company_id: int, embedding_model, faiss_folder: str):
     cursor = conn.cursor()
-    cursor.execute("SELECT id, title, content FROM KBDocument WHERE company_id = ?", (company_id,))
-    kb_rows = cursor.fetchall()
+    cursor.execute(
+        "SELECT id, title, content FROM KBDocument WHERE company_id = ?",
+        (company_id,)
+    )
+    rows = cursor.fetchall()
+    if not rows:
+        st.warning("No KB documents found for this company.")
+        return None
+    docs = [f"{r[1]}. {r[2]}" for r in rows]
+    # Build new index
+    faiss_index = FAISS.from_texts(docs, embedding_model)
+    # Persist to disk
+    if os.path.exists(faiss_folder):
+        import shutil
+        shutil.rmtree(faiss_folder)
+    faiss_index.save_local(faiss_folder)
+    st.success(f"✅ KB loaded for company {company_id} ({len(docs)} docs)")
+    return faiss_index
 
-    if kb_rows:
-        # You can combine title + content as document text for better context
-        docs = [f"{row[1]}. {row[2]}" for row in kb_rows]  # title + content
-        ids = [f"kb-{row[0]}" for row in kb_rows]
-        embeddings = embedding_model.encode(docs).tolist()
-
-        # Clear existing docs for this company before adding new ones
-        collection.delete(where={"company_id": company_id})
-        collection.add(documents=docs, ids=ids, embeddings=embeddings, metadatas=[{"company_id": company_id}] * len(docs))
-        st.success(f"✅ Knowledge Base loaded for company ID {company_id} with {len(docs)} documents.")
-        
-def get_top_k_chunks(query, k=3):
-    query_embedding = embedding_model.encode([query])[0].tolist()
-    results = collection.query(query_embeddings=[query_embedding], n_results=k)
-    return results['documents'][0] if results['documents'] else []
-
-
+def get_top_k_chunks_faiss(query: str, faiss_folder: str, k: int = 3) -> list:
+    if not os.path.exists(faiss_folder):
+        st.warning(f"FAISS folder {faiss_folder} does not exist.")
+        return []
+    db = FAISS.load_local(
+        folder_path=faiss_folder,
+        embeddings=HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2"),
+        allow_dangerous_deserialization=True,
+    )
+    results = db.similarity_search(query, k=k)
+    return [doc.page_content for doc in results]
 
 def chatbot_page():
-
-    user_name = st.session_state.get("user_name")
-
-    st.title("💬 Hack_X Support Chatbot")
-
-    # 1. Ensure session + ticket exist
+    # Ensure session and ticket
     if "session_id" not in st.session_state or "ticket_id" not in st.session_state:
         st.warning("Please start or resume a session from the home page.")
         st.stop()
-    
-    history = load_ticket_chat(st.session_state["ticket_id"])
-    for sender, msg in history:
-        with st.chat_message(sender):
-            st.write(msg)
 
-    ticket_id = st.session_state.get("ticket_id")
-    if not ticket_id:
-        st.warning("⚠️ No ticket found. Please raise a ticket first.")
-        return
-
+    ticket_id = st.session_state["ticket_id"]
     conn = get_connection()
-    c = conn.cursor()
+    ticket = get_ticket_details(conn, ticket_id)
 
-    c.execute("SELECT product, problem_description, priority, company_id, status FROM Tickets WHERE id = ?", (ticket_id,))
-    ticket = c.fetchone()
+    st.title("💬 Hack_X Support Chatbot")
 
-    if ticket:
-        product, problem_description, priority, company_id, status = ticket
-
-        if status.lower() == "closed":
-            st.warning("🚫 This ticket has already been closed. No further messages can be sent.")
-            return
-            # Only auto-refresh if this ticket is in handoff
-        if status.lower() == "handoff":
-            st_autorefresh(interval=15000, limit=None, key="chat_refresh")
-        
-        if status.lower() == "handoff":
-            st.warning("🔁 This ticket has been escalated to a human agent. Please wait for them to reply here.")
-            # Still allow the user to type, but skip LLM
-            user_input = st.chat_input("Your message…")
-            if user_input:
-                # echo back their message
-                st.chat_message("user").write(user_input)
-                # save it so the agent sees it
-                save_chat_message(
-                    session_id=st.session_state["session_id"],
-                    sender="user",
-                    message=user_input,
-                    ticket_id=ticket_id
-                )
-                # optionally remind again
-                st.info("Your message has been sent to the agent. They'll reply in this same window.")
-            return   # skip the rest of the LLM logic
-
-
-        st.markdown(f"**Ticket #{ticket_id}**")
-        st.markdown(f"- **Product:** {product}")
-        st.markdown(f"- **Priority:** {priority}")
-        st.markdown(f"- **Description:** {problem_description}")
-        st.markdown("---")
-    else:
+    if not ticket:
         st.error("❌ Ticket not found.")
         return
 
+    product, problem_description, priority, company_id, status = ticket
 
-    # Load KB into Chroma for this company
-    load_kb_to_chroma(conn, company_id)
+    # Status checks
+    if status.lower() == "closed":
+        st.warning("🚫 This ticket has already been closed.")
+        return
+    if status.lower() == "handoff":
+        st_autorefresh(interval=15000, limit=None, key="refresh")
+        st.warning("🔁 Ticket escalated to human agent. Please wait.")
+        user_input = st.chat_input("Your message…")
+        if user_input:
+            st.chat_message("user").write(user_input)
+            save_chat_message(
+                st.session_state.session_id, "user", user_input, ticket_id
+            )
+            st.info("Your message has been sent to the agent.")
+        return
 
+    # Display ticket info
+    st.markdown(f"**Ticket #{ticket_id}**")
+    st.markdown(f"- **Product:** {product}")
+    st.markdown(f"- **Priority:** {priority}")
+    st.markdown(f"- **Description:** {problem_description}")
+    st.markdown("---")
+
+    # Load or create FAISS
+    vectorstore, embedding_model, faiss_folder = load_faiss_index(company_id)
+    faiss_index = load_kb_to_faiss(conn, company_id, embedding_model, faiss_folder)
+
+    # Check inactivity
     if check_inactivity_and_close(st.session_state["session_id"], ticket_id):
-        return  # Exit the chatbot
+        return
 
+    # Display history
+    history = load_ticket_chat(ticket_id)
+    for sender, msg in history:
+        st.chat_message(sender).write(msg)
+
+    # User input
     user_input = st.chat_input("Ask about your issue...")
-    if user_input:
+    if not user_input:
+        return
 
-         # Check for closing message
-        if check_if_closing_message(user_input):
-            c.execute("UPDATE Tickets SET status = 'closed' WHERE id = ?", (ticket_id,))
-            conn.commit()
-            st.success("✅ Ticket marked as closed. Thank you!")
-            return  # stop further interaction
+    # Handle closing
+    if check_if_closing_message(user_input):
+        c = conn.cursor()
+        c.execute("UPDATE Tickets SET status='closed' WHERE id=?", (ticket_id,))
+        conn.commit()
+        st.success("✅ Ticket marked as closed.")
+        return
 
-        # 2. Get the top-k KB chunks
-        top_chunks = get_top_k_chunks(user_input, k=3)
-        kb_context = "\n\n".join(top_chunks)
+    # Retrieve KB context
+    top_chunks = get_top_k_chunks_faiss(user_input, faiss_folder)
+    context = "\n\n".join(top_chunks)
 
-        # 3. Fetch the ticket metadata you unpacked earlier
-        #    (Make sure ticket = c.fetchone() ran above in your code)
-        #    e.g. ticket = (product, desc, prio, company_id)
-
-        # 4. Call the LLM
-        bot_reply = call_gemini_llm(
-            history=history,
-            context=kb_context,
-            query=user_input,
-            ticket=ticket
+    # Call LLM
+    bot_reply = call_gemini_llm(history, context, user_input, ticket)
+    if "[HANDOFF_REQUIRED]" in bot_reply:
+        conn.cursor().execute(
+            "UPDATE Tickets SET status='Handoff' WHERE id=?", (ticket_id,)
         )
+        conn.commit()
+        st.warning("🔁 Ticket marked for human assistance.")
+        st.rerun()
 
-        # 4.5 Check for LLM-triggered handoff
-        if "[HANDOFF_REQUIRED]" in bot_reply:
-            c.execute("UPDATE Tickets SET status = 'Handoff' WHERE id = ?", (ticket_id,))
-            conn.commit()
-            st.warning("🔁 Your ticket has been marked for human assistance.")
-            st.rerun()
-
-            # Optional: remove the marker before displaying
-            bot_reply = bot_reply.replace("[HANDOFF_REQUIRED]", "").strip()
+    # Display and save
+    st.chat_message("user").write(user_input)
+    st.chat_message("assistant").write(bot_reply)
+    save_chat_message(st.session_state.session_id, "user", user_input, ticket_id)
+    save_chat_message(st.session_state.session_id, "assistant", bot_reply, ticket_id)
 
 
-        # 5. Display both sides
-        st.chat_message("user").write(user_input)
-        st.chat_message("bot").write(bot_reply)
-
-        save_chat_message(
-            session_id=st.session_state["session_id"],
-            sender="user",
-            message=user_input,
-            ticket_id=st.session_state["ticket_id"]
-        )
-        save_chat_message(
-            session_id=st.session_state["session_id"],
-            sender="assistant",
-            message=bot_reply,
-            ticket_id=st.session_state["ticket_id"]
-        )
-
-chatbot_page()
+# Run
+if __name__ == "__main__":
+    chatbot_page()
