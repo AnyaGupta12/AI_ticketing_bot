@@ -76,7 +76,7 @@ def init_db():
         session_id  TEXT,                        -- now nullable
         user_name   TEXT NOT NULL,
         sender      TEXT 
-                    CHECK(sender IN ('user','bot','agent')) 
+                    CHECK(sender IN ('user','assistant')) 
                     NOT NULL,
         message     TEXT NOT NULL,
         timestamp   DATETIME DEFAULT CURRENT_TIMESTAMP,

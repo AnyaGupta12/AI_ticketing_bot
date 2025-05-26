@@ -131,6 +131,8 @@ def main():
         st.rerun()  # Redirect to the raise ticket page
     elif st.session_state.page == "Portal":
         st.switch_page("pages/portal.py")  # Your other page function
+    else:
+        st.switch_page("pages/portal.py")
 
 if __name__ == "__main__":
     main()

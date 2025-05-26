@@ -60,31 +60,39 @@ def build_prompt(history, context, ticket, user_input):
     )
 
     # 4. Assemble full prompt
-    prompt = f"""
-You are a helpful support assistant. Continue the conversation and assist the user based on the knowledge base and ticket context.
+    prompt = f"""You are a highly knowledgeable support assistant whose job is to resolve customer issues quickly and accurately. You have access to:
 
-If the user's question:
-- cannot be answered using the knowledge base,
-- is unclear, illogical, or off-topic,
-- or requires a human agent's help (e.g. refund requests, complaints, escalation, sensitive cases),
+1. **Ticket Details**  
+   Ticket #{{ticket_id}}  
+   • Product: {{product}}  
+   • Priority: {{priority}}  
+   • Description: {{description}}  
+   • Company ID: {{company_id}}  
+   • Contact: {{contact_name}}
 
-then **mark the response with**:
+2. **Relevant Knowledge Base Excerpts**  
+   {{#if context}}
+   {{context}}
+   {{else}}
+   [No relevant KB context found]
+   {{/if}}
 
-**[HANDOFF_REQUIRED]**
+3. **Recent Conversation History** (last 10 turns):  
+   {{#each history}}
+   {{sender}}: {{message}}
+   {{/each}}
 
-! Do **NOT** trigger handoff for casual messages such as "hi", "hello", "how are you", "thank you", or other greetings or you feel it is normal human behavior.
+**Your instructions:**  
+- **Primary Source:** If the KB excerpts contain all or part of the answer, use only that information—do not fabricate or add external data.  
+- **Secondary Source:** If the KB is empty or insufficient, draw on your broader expertise or reliable online resources via Gemini to craft a complete, accurate, and concise response.  
+- **Tone & Style:** Be professional, empathetic, and clear. Use bullet points or numbered steps if it helps the user.  
+- **Scope:** Answer the user’s question directly. Do not initiate a handoff or mention internal processes.  
 
-{ticket_info}
+**User’s question:**  
+{{user_input}}
 
-Conversation so far:
-{convo}
-
-Knowledge Base Context:
-{context}
-
-User: {user_input}
-
-Assistant:"""
+**Assistant’s response:**  
+"""
     return prompt.strip()
 
 def call_gemini_llm(history, context: str, query: str, ticket: tuple) -> str:
@@ -155,9 +163,6 @@ def chatbot_page():
 
     user_name = st.session_state.get("user_name")
 
-    # This will rerun the script every 10 seconds (10000 ms)
-    st_autorefresh(interval=15000, limit=None, key="chat_refresh")
-
     st.title("💬 Hack_X Support Chatbot")
 
     # 1. Ensure session + ticket exist
@@ -187,6 +192,9 @@ def chatbot_page():
         if status.lower() == "closed":
             st.warning("🚫 This ticket has already been closed. No further messages can be sent.")
             return
+            # Only auto-refresh if this ticket is in handoff
+        if status.lower() == "handoff":
+            st_autorefresh(interval=15000, limit=None, key="chat_refresh")
         
         if status.lower() == "handoff":
             st.warning("🔁 This ticket has been escalated to a human agent. Please wait for them to reply here.")
@@ -254,6 +262,7 @@ def chatbot_page():
             c.execute("UPDATE Tickets SET status = 'Handoff' WHERE id = ?", (ticket_id,))
             conn.commit()
             st.warning("🔁 Your ticket has been marked for human assistance.")
+            st.rerun()
 
             # Optional: remove the marker before displaying
             bot_reply = bot_reply.replace("[HANDOFF_REQUIRED]", "").strip()
