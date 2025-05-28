@@ -80,7 +80,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Title
-st.markdown("<div class='title'>Welcome to Hack_X Support Platform</div>", unsafe_allow_html=True)
+st.markdown("<div class='title'>🚀 Welcome to Hack_X Support Platform</div>", unsafe_allow_html=True)
 
 # Role Cards
 col1, col2, col3 = st.columns(3)
@@ -131,8 +131,6 @@ def main():
         st.rerun()  # Redirect to the raise ticket page
     elif st.session_state.page == "Portal":
         st.switch_page("pages/portal.py")  # Your other page function
-    else:
-        st.switch_page("pages/portal.py")
 
 if __name__ == "__main__":
     main()

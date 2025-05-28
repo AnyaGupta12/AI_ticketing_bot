@@ -1,281 +1,188 @@
 import streamlit as st
 import sqlite3
+import chromadb
+from chromadb.utils import embedding_functions
+from sentence_transformers import SentenceTransformer
+from pages.raise_ticket import load_recent_chat, save_chat_message
 import requests
 import json
-import os
-import pickle
-from datetime import datetime, timedelta
-from streamlit_autorefresh import st_autorefresh
-from sentence_transformers import SentenceTransformer
-from langchain.vectorstores import FAISS
-from langchain.embeddings import HuggingFaceEmbeddings
-from pages.raise_ticket import save_chat_message, check_inactivity_and_close
 
-# Constants
 GEMINI_API_KEY = "AIzaSyCl-Ys-YuIoTBzN0fI8gcLmyIZsRp_zxWY"
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-    f"?key={GEMINI_API_KEY}"
-)
-CLOSING_KEYWORDS = ["thank you", "thanks", "bye", "goodbye", "see you"]
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=" + GEMINI_API_KEY
 
-# Utility functions
+def build_prompt(history, context, ticket, user_input):
+    # 1. Take the last 10 messages (or fewer if history is shorter)
+    recent = history[-10:] if len(history) > 10 else history
 
-def get_cutoff(minutes: int) -> datetime:
-    return datetime.now() - timedelta(minutes=minutes)
+    # 2. Turn into "User: …" / "Bot: …" lines
+    convo = "\n".join(f"{sender.capitalize()}: {msg}" for sender, msg in recent)
+
+    # 3. Unpack ticket into named fields
+    prod, desc, prio, cid = ticket
+    ticket_info = (
+        f"Ticket #{st.session_state.get('ticket_id')} info:\n"
+        f"- Product: {prod}\n"
+        f"- Priority: {prio}\n"
+        f"- Description: {desc}"
+    )
+
+    # 4. Assemble full prompt
+    prompt = f"""
+You are a helpful support assistant. Continue the conversation below, then answer the final user question.
+
+{ticket_info}
+
+Conversation so far:
+{convo}
+
+Knowledge Base Context:
+{context}
+
+User: {user_input}
+
+Assistant:"""
+    return prompt.strip()
+
+def call_gemini_llm(history, context: str, query: str, ticket: tuple) -> str:
+    prompt = build_prompt(history, context, ticket, query)
+
+    payload = {
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }]
+    }
+    headers = {"Content-Type": "application/json"}
+
+    resp = requests.post(GEMINI_URL, headers=headers, data=json.dumps(payload))
+    if resp.status_code == 200:
+        return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+    else:
+        return f"Error: {resp.status_code} – {resp.text}"
+
+# Setup embedding model
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+
+# Setup ChromaDB in-memory client
+chroma_client = chromadb.Client()
+collection = chroma_client.get_or_create_collection(name="company_kb")
 
 @st.cache_resource
 def get_connection():
     return sqlite3.connect("app.db", check_same_thread=False)
 
-def get_ticket_details(conn, ticket_id):
-    c = conn.cursor()
-    c.execute(
-        """
-        SELECT product, problem_description, priority, company_id, status
-          FROM Tickets
-         WHERE id = ?
-        """,
-        (ticket_id,)
-    )
-    return c.fetchone()
-
-
-def load_ticket_chat(ticket_id):
-    conn = get_connection()
-    c = conn.cursor()
-    cutoff = get_cutoff(30)
-    c.execute(
-        """
-        SELECT sender, message
-          FROM chat_sessions
-         WHERE ticket_id = ?
-           AND timestamp >= ?
-         ORDER BY timestamp
-        """,
-        (ticket_id, cutoff)
-    )
-    return c.fetchall()
-
-
-def check_if_closing_message(message: str) -> bool:
-    return any(kw in message.lower() for kw in CLOSING_KEYWORDS)
-
-
-def build_prompt(history, context, ticket, user_input):
-    recent = history[-10:] if len(history) > 10 else history
-
-    convo = "\n".join(f"{sender.capitalize()}: {msg}" for sender, msg in recent)
-
-    prod, desc, prio, cid, contact_name = ticket
-    ticket_info = (
-        f"Ticket #{st.session_state.get('ticket_id')} info:\n"
-        f"- Product: {prod}\n"
-        f"- Priority: {prio}\n"
-        f"- Description: {desc}\n"
-        f"- Company ID: {cid}\n"
-        f"- Contact Name: {contact_name}"
-    )
-
-    context_block = context if context else "[No relevant KB context found]"
-
-    prompt = f"""You are a highly knowledgeable support assistant whose job is to resolve customer issues quickly and accurately. You have access to:
-
-1. **Ticket Details**  
-{ticket_info}
-
-2. **Relevant Knowledge Base Excerpts**  
-{context_block}
-
-3. **Recent Conversation History** (last 10 turns):  
-{convo}
-
-**Your instructions:**  
-- **Primary Source:** If the KB excerpts contain all or part of the answer, use only that information—do not fabricate or add external data.  
-- **Secondary Source:** If the KB is empty or insufficient, draw on your broader expertise or reliable online resources via Gemini to craft a complete, accurate, and concise response.  
-- **Tone & Style:** Be professional, empathetic, and clear. Use bullet points or numbered steps if it helps the user.  
-- **Scope:** Answer the user’s question directly. Do not initiate a handoff or mention internal processes.  
--** whenever there is "forward me to human agent query mark it as [HANDOFF_REQUIRED] in the response.
-
-**User’s question:**  
-{user_input}
-
-**Assistant’s response:**  
-"""
-    return prompt.strip()
-
-
-def call_gemini_llm(history, context: str, query: str, ticket: tuple) -> str:
-    prompt = build_prompt(history, context, ticket, query)
-    payload = {"contents": [{"parts": [{"text": prompt}]}]}
-    headers = {"Content-Type": "application/json"}
-    resp = requests.post(GEMINI_URL, headers=headers, data=json.dumps(payload))
-    if resp.status_code != 200:
-        return f"Error: {resp.status_code} - {resp.text}"
-    data = resp.json()
-    try:
-        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        # Optional JSON parsing
-        try:
-            parsed = json.loads(text)
-            return parsed.get("response", text)
-        except json.JSONDecodeError:
-            return text
-    except Exception as e:
-        return f"Error parsing response: {e}"
-
-
-def load_faiss_index(company_id: int):
-    embedding_model = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
-    )
-    faiss_folder = f"faiss_index_company_{company_id}"
-    if os.path.exists(faiss_folder):
-        st.info(f"Loading FAISS index from {faiss_folder}")
-        db = FAISS.load_local(
-            folder_path=faiss_folder,
-            embeddings=embedding_model,
-            allow_dangerous_deserialization=True,
-        )
-        return db, embedding_model, faiss_folder
-    st.warning(f"No FAISS index found for company {company_id}")
-    return None, embedding_model, faiss_folder
-
-def load_kb_to_faiss(conn, company_id: int, embedding_model, faiss_folder: str):
+def load_kb_to_chroma(conn, company_id):
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, title, content FROM KBDocument WHERE company_id = ?",
-        (company_id,)
-    )
-    rows = cursor.fetchall()
-    if not rows:
-        st.warning("No KB documents found for this company.")
-        return None
-    docs = [f"{r[1]}. {r[2]}" for r in rows]
-    # Build new index
-    faiss_index = FAISS.from_texts(docs, embedding_model)
-    # Persist to disk
-    if os.path.exists(faiss_folder):
-        import shutil
-        shutil.rmtree(faiss_folder)
-    faiss_index.save_local(faiss_folder)
-    st.success(f"✅ KB loaded for company {company_id} ({len(docs)} docs)")
-    return faiss_index
+    cursor.execute("SELECT id, title, content FROM KBDocument WHERE company_id = ?", (company_id,))
+    kb_rows = cursor.fetchall()
 
-def get_top_k_chunks_faiss(query: str, faiss_folder: str, k: int = 3) -> list:
-    if not os.path.exists(faiss_folder):
-        st.warning(f"FAISS folder {faiss_folder} does not exist.")
-        return []
-    db = FAISS.load_local(
-        folder_path=faiss_folder,
-        embeddings=HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2"),
-        allow_dangerous_deserialization=True,
-    )
-    results = db.similarity_search(query, k=k)
-    return [doc.page_content for doc in results]
+    if kb_rows:
+        # You can combine title + content as document text for better context
+        docs = [f"{row[1]}. {row[2]}" for row in kb_rows]  # title + content
+        ids = [f"kb-{row[0]}" for row in kb_rows]
+        embeddings = embedding_model.encode(docs).tolist()
+
+        # Clear existing docs for this company before adding new ones
+        collection.delete(where={"company_id": company_id})
+        collection.add(documents=docs, ids=ids, embeddings=embeddings, metadatas=[{"company_id": company_id}] * len(docs))
+        st.success(f"✅ Knowledge Base loaded for company ID {company_id} with {len(docs)} documents.")
+        
+def get_top_k_chunks(query, k=3):
+    query_embedding = embedding_model.encode([query])[0].tolist()
+    results = collection.query(query_embeddings=[query_embedding], n_results=k)
+    return results['documents'][0] if results['documents'] else []
 
 def chatbot_page():
-    # Ensure session and ticket
-    if "session_id" not in st.session_state or "ticket_id" not in st.session_state:
-        st.warning("Please start or resume a session from the home page.")
-        st.stop()
-
-    ticket_id = st.session_state["ticket_id"]
-    conn = get_connection()
-    ticket = get_ticket_details(conn, ticket_id)
 
     st.title("💬 Hack_X Support Chatbot")
 
-    if not ticket:
+    # --- Ensure required session info exists ---
+    if "session_id" not in st.session_state or "user_name" not in st.session_state:
+        st.warning("Session not initialized. Please go to the home page to start or resume a chat.")
+        st.stop()
+
+    # --- Load chat history once per session ---
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = load_recent_chat(st.session_state["session_id"])
+    
+    # --- Display existing messages ---
+    for sender, msg in st.session_state.chat_history:
+        with st.chat_message(sender):
+            st.write(msg)
+
+    ticket_id = st.session_state.get("ticket_id")
+    if not ticket_id:
+        st.warning("⚠️ No ticket found. Please raise a ticket first.")
+        return
+
+    conn = get_connection()
+    c = conn.cursor()
+
+    c.execute("SELECT product, problem_description, priority, company_id FROM Tickets WHERE id = ?", (ticket_id,))
+    ticket = c.fetchone()
+
+    if ticket:
+        product, problem_description, priority, company_id = ticket
+        st.markdown(f"**Ticket #{ticket_id}**")
+        st.markdown(f"- **Product:** {product}")
+        st.markdown(f"- **Priority:** {priority}")
+        st.markdown(f"- **Description:** {problem_description}")
+        st.markdown("---")
+    else:
         st.error("❌ Ticket not found.")
         return
 
-    product, problem_description, priority, company_id, status = ticket
+    # Load KB into Chroma for this company
+    load_kb_to_chroma(conn, company_id)
 
-    history = load_ticket_chat(ticket_id)
-    for sender, msg in history:
-        st.chat_message(sender).write(msg)
+    user_input = st.chat_input("Ask about your issue...")
+    if user_input:
+        # 1. Pull in the last 10 messages for context
+        history = st.session_state.chat_history
 
-    # Status checks
-    if status.lower() == "closed":
-        st.warning("🚫 This ticket has already been closed.")
-        return
-    
-    if status.lower() == "handoff":
-        st_autorefresh(interval=15000, limit=None, key="refresh")
-        st.warning("🔁 Ticket escalated to human agent. Please wait.")
+        # 2. Get the top-k KB chunks
+        top_chunks = get_top_k_chunks(user_input, k=3)
+        kb_context = "\n\n".join(top_chunks)
 
-        user_input = st.chat_input("Your message…")
-        if user_input:
-            # echo & persist
-            st.chat_message("user").write(user_input)
-            save_chat_message(
-                session_id=st.session_state["session_id"],
-                sender="user",
-                message=user_input,
-                ticket_id=ticket_id
-            )
-            st.info("Your message has been sent to the agent.")
-            # refresh to show the newly saved message
-            st.rerun()
+        # 3. Fetch the ticket metadata you unpacked earlier
+        #    (Make sure `ticket = c.fetchone()` ran above in your code)
+        #    e.g. ticket = (product, desc, prio, company_id)
 
-        # don’t return here—let the page stay open so autorefresh can pull in new agent replies
-        return
+        # 4. Call the LLM with history + KB + ticket info baked in
+        bot_reply = call_gemini_llm(
+            history=history,
+            context=kb_context,
+            query=user_input,
+            ticket=ticket
+        )
 
-    # Display ticket info
-    st.markdown(f"**Ticket #{ticket_id}**")
-    st.markdown(f"- **Product:** {product}")
-    st.markdown(f"- **Priority:** {priority}")
-    st.markdown(f"- **Description:** {problem_description}")
+        # 5. Display both sides
+        st.chat_message("user").write(user_input)
+        st.chat_message("bot").write(bot_reply)
+
+        # 6. Append to session_state and save to DB
+        st.session_state.chat_history.extend([
+            ("user", user_input),
+            ("bot", bot_reply)
+        ])
+        save_chat_message(
+            session_id=st.session_state["session_id"],
+            user_name=st.session_state["user_name"],
+            sender="user",
+            message=user_input,
+            ticket_id=st.session_state["ticket_id"]
+        )
+        save_chat_message(
+            session_id=st.session_state["session_id"],
+            user_name=st.session_state["user_name"],
+            sender="bot",
+            message=bot_reply,
+            ticket_id=st.session_state["ticket_id"]
+        )
+
+
+    for sender, msg in st.session_state.chat_history:
+        with st.chat_message(sender):
+            st.write(msg)
     st.markdown("---")
 
-    # Load or create FAISS
-    vectorstore, embedding_model, faiss_folder = load_faiss_index(company_id)
-    faiss_index = load_kb_to_faiss(conn, company_id, embedding_model, faiss_folder)
-
-    # Check inactivity
-    if check_inactivity_and_close(st.session_state["session_id"], ticket_id):
-        return
-
-    # Display history
-    history = load_ticket_chat(ticket_id)
-    for sender, msg in history:
-        st.chat_message(sender).write(msg)
-
-    # User input
-    user_input = st.chat_input("Ask about your issue...")
-    if not user_input:
-        return
-
-    # Handle closing
-    if check_if_closing_message(user_input):
-        c = conn.cursor()
-        c.execute("UPDATE Tickets SET status='closed' WHERE id=?", (ticket_id,))
-        conn.commit()
-        st.success("✅ Ticket marked as closed.")
-        return
-
-    # Retrieve KB context
-    top_chunks = get_top_k_chunks_faiss(user_input, faiss_folder)
-    context = "\n\n".join(top_chunks)
-
-    # Call LLM
-    bot_reply = call_gemini_llm(history, context, user_input, ticket)
-    if "[HANDOFF_REQUIRED]" in bot_reply:
-        conn.cursor().execute(
-            "UPDATE Tickets SET status='Handoff' WHERE id=?", (ticket_id,)
-        )
-        conn.commit()
-        st.warning("🔁 Ticket marked for human assistance.")
-        st.rerun()
-
-    # Display and save
-    st.chat_message("user").write(user_input)
-    st.chat_message("assistant").write(bot_reply)
-    save_chat_message(st.session_state.session_id, "user", user_input, ticket_id)
-    save_chat_message(st.session_state.session_id, "assistant", bot_reply, ticket_id)
-
-
-# Run
-if __name__ == "__main__":
-    chatbot_page()
+chatbot_page()
